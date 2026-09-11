@@ -4,15 +4,20 @@ import { persist } from "zustand/middleware";
 import { nanoid } from "nanoid";
 
 import i18n from "@/i18n";
+import { fetchDefaultConfig } from "@/services/default-config";
 
-export type ApiCallFormat = "openai" | "gemini";
+export type ApiCallFormat = "openai" | "gemini" | "seedream" | "autodl" | "grok";
 export type ModelCapability = "image" | "video" | "text" | "audio";
 export type ReasoningEffort = "auto" | "low" | "medium" | "high" | "xhigh";
 
 export type ChannelModel = {
     name: string;
+    /** Optional human-friendly label; falls back to `name` when unset. */
+    displayName?: string;
     capability: ModelCapability;
     script?: string;
+    /** JSON request body template for providers whose parameters differ per model, e.g. AutoDL workflows. */
+    params?: string;
 };
 
 export type ModelChannel = {
@@ -22,6 +27,10 @@ export type ModelChannel = {
     apiKey: string;
     apiFormat: ApiCallFormat;
     models: ChannelModel[];
+    /** Send image edits as application/json instead of the OpenAI multipart body. */
+    editJson?: boolean;
+    /** Channel comes from the site `/config.json`; shown with a `默认` marker. Editing it promotes it to a user-owned channel. */
+    locked?: boolean;
 };
 
 export type AiConfig = {
@@ -74,6 +83,15 @@ export const CONFIG_STORE_KEY = "infinite-canvas:ai_config_store";
 const CHANNEL_MODEL_SEPARATOR = "::";
 const OPENAI_BASE_URL = "https://api.openai.com";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com";
+const SEEDREAM_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3";
+const AUTODL_BASE_URL = "https://autodl.art/api/v1/comfyui";
+const GROK_BASE_URL = "https://api.x.ai";
+/** Placeholders are replaced with the current prompt, duration, resolution, orientation, size and first reference image. */
+export const AUTODL_DEFAULT_PARAMS = `{
+  "prompt": "{{prompt}}",
+  "duration": {{duration}},
+  "resolution": "{{resolution}}{{orientation}}"
+}`;
 export const LOCAL_PROXY_PACKAGE = "@basketikun/canvas-proxy";
 export const DEFAULT_LOCAL_PROXY_URL = "http://127.0.0.1:23210";
 
@@ -115,7 +133,7 @@ export const defaultConfig: AiConfig = {
     reasoningEffort: "auto",
     models: ["default::gpt-image-2", "default::grok-imagine-video", "default::gpt-5.5", "default::gpt-4o-mini-tts"],
     quality: "auto",
-    size: "1:1",
+    size: "1024x1024",
     background: "",
     count: "1",
     canvasImageCount: "3",
@@ -134,6 +152,8 @@ export const defaultWebdavSyncConfig: WebdavSyncConfig = {
 type ConfigStore = {
     config: AiConfig;
     webdav: WebdavSyncConfig;
+    /** Site defaults from `/config.json`; re-applied on every page load and kept null when the file is missing. */
+    remoteConfig: Partial<AiConfig> | null;
     isConfigOpen: boolean;
     configTab: ConfigTabKey;
     shouldPromptContinue: boolean;
@@ -144,6 +164,8 @@ type ConfigStore = {
     openConfigDialog: (shouldPromptContinue?: boolean, tab?: ConfigTabKey) => void;
     setConfigDialogOpen: (isOpen: boolean) => void;
     clearPromptContinue: () => void;
+    loadRemoteConfig: () => Promise<boolean>;
+    applyConfig: (config: AiConfig) => void;
 };
 
 const VIDEO_KEYWORDS = ["video", "sora", "veo", "kling", "wan", "hailuo"];
@@ -198,16 +220,81 @@ export function resolveModelScript(config: AiConfig, value: string) {
     return findChannelModel(config, value)?.model.script?.trim() || "";
 }
 
+/** The JSON request body template (if any) attached to a model; empty string means use the provider default. */
+export function resolveModelParams(config: AiConfig, value: string) {
+    return findChannelModel(config, value)?.model.params?.trim() || "";
+}
+
+/** xAI and many relays reject multipart image edits, so a channel can opt into a JSON edit body. */
+export function resolveChannelEditJson(config: AiConfig, value: string) {
+    return findChannelModel(config, value)?.channel.editJson === true;
+}
+
 function isAiConfigReady(config: AiConfig, model: string) {
     const channel = resolveModelChannel(config, model);
     return Boolean(model.trim() && channel.baseUrl.trim() && channel.apiKey.trim());
 }
+
+/** Keep the current model when it is still selectable, otherwise fall back to the first one with the same capability. */
+export function pickDefaultModel(config: AiConfig, capability: ModelCapability, current: string) {
+    const options = selectableModelsByCapability(config, capability);
+    const normalized = normalizeModelOptionValue(current, config.channels);
+    return options.includes(normalized) ? normalized : options[0] || "";
+}
+
+/** The untouched built-in channel is redundant once the site config brings its own defaults. */
+function isPlaceholderChannel(channel: ModelChannel) {
+    const fallback = defaultConfig.channels[0];
+    return channel.id === fallback.id && channel.baseUrl === fallback.baseUrl && !channel.apiKey.trim();
+}
+
+/** Merge the site defaults from `/config.json` into a user config. Remote channels are marked as defaults; a user-owned (edited) channel with the same id takes precedence so edits persist across reloads. */
+function mergeRemoteConfig(config: AiConfig, remote: Partial<AiConfig> | null): AiConfig {
+    const remoteChannels = (Array.isArray(remote?.channels) ? remote.channels : []).map((channel, index) =>
+        createModelChannel({ ...channel, id: channel?.id?.trim() || `site-${index + 1}`, locked: true }),
+    );
+    const userChannels = config.channels
+        .filter((channel) => !channel.locked)
+        .filter((channel) => !remoteChannels.length || !isPlaceholderChannel(channel));
+    const userById = new Map(userChannels.map((channel) => [channel.id, channel]));
+    const channels: ModelChannel[] = [];
+    remoteChannels.forEach((remote) => {
+        channels.push(userById.get(remote.id) || remote);
+        userById.delete(remote.id);
+    });
+    userById.forEach((channel) => channels.push(channel));
+    const merged: AiConfig = {
+        ...config,
+        channels,
+        models: modelOptionsFromChannels(channels),
+        baseUrl: channels[0]?.baseUrl || config.baseUrl,
+        apiKey: channels[0]?.apiKey || config.apiKey,
+        apiFormat: channels[0]?.apiFormat || config.apiFormat,
+    };
+    const values = merged as unknown as Record<string, unknown>;
+    (Object.keys(remote || {}) as Array<keyof AiConfig>).forEach((key) => {
+        if (key === "channels" || key === "models") return;
+        const value = remote?.[key];
+        if (typeof value !== "string" || !value.trim()) return;
+        if (!String(values[key] ?? "").trim()) values[key] = value;
+    });
+    return {
+        ...merged,
+        imageModel: pickDefaultModel(merged, "image", merged.imageModel),
+        videoModel: pickDefaultModel(merged, "video", merged.videoModel),
+        textModel: pickDefaultModel(merged, "text", merged.textModel),
+        audioModel: pickDefaultModel(merged, "audio", merged.audioModel),
+    };
+}
+
+let remoteConfigPromise: Promise<boolean> | null = null;
 
 export const useConfigStore = create<ConfigStore>()(
     persist(
         (set, get) => ({
             config: defaultConfig,
             webdav: defaultWebdavSyncConfig,
+            remoteConfig: null,
             isConfigOpen: false,
             configTab: "channels",
             shouldPromptContinue: false,
@@ -235,17 +322,34 @@ export const useConfigStore = create<ConfigStore>()(
             openConfigDialog: (shouldPromptContinue = false, configTab = "channels") => set({ isConfigOpen: true, shouldPromptContinue, configTab }),
             setConfigDialogOpen: (isConfigOpen) => set({ isConfigOpen }),
             clearPromptContinue: () => set({ shouldPromptContinue: false }),
+            loadRemoteConfig: () => {
+                remoteConfigPromise ||= fetchDefaultConfig()
+                    .then((remote) => {
+                        if (!remote) return false;
+                        set((state) => ({ remoteConfig: remote, config: mergeRemoteConfig(state.config, remote) }));
+                        return true;
+                    })
+                    .finally(() => {
+                        remoteConfigPromise = null;
+                    });
+                return remoteConfigPromise;
+            },
+            applyConfig: (config) => set((state) => ({ config: mergeRemoteConfig(config, state.remoteConfig) })),
         }),
         {
             name: CONFIG_STORE_KEY,
-            partialize: (state) => ({ config: state.config, webdav: state.webdav }),
+            partialize: (state) => {
+                const channels = state.config.channels.filter((channel) => !channel.locked);
+                return { config: { ...state.config, channels, models: modelOptionsFromChannels(channels) }, webdav: state.webdav };
+            },
             merge: (persisted, current) => {
                 const persistedState = (persisted || {}) as Partial<ConfigStore>;
                 const persistedConfig = (persistedState.config || {}) as Partial<AiConfig>;
                 const persistedWebdav = (persistedState.webdav || {}) as Partial<WebdavSyncConfig>;
                 const config = { ...defaultConfig, ...persistedConfig };
-                if (!Array.isArray(persistedConfig.channels)) config.channels = [];
-                const channels = normalizeChannels(config);
+                const hasPersistedChannels = Array.isArray(persistedConfig.channels);
+                if (!hasPersistedChannels) config.channels = [];
+                const channels = normalizeChannels(config, !hasPersistedChannels);
                 const models = modelOptionsFromChannels(channels);
                 return {
                     ...current,
@@ -295,7 +399,9 @@ export function normalizeChannelModels(models: Array<string | ChannelModel> | un
         seen.add(name);
         const capability = typeof item === "string" ? guessCapability(name) : item.capability || guessCapability(name);
         const script = typeof item === "string" ? undefined : item.script?.trim() || undefined;
-        result.push({ name, capability, script });
+        const params = typeof item === "string" ? undefined : item.params?.trim() || undefined;
+        const displayName = typeof item === "string" ? undefined : item.displayName?.trim() || undefined;
+        result.push({ name, capability, script, params, displayName });
     }
     return result;
 }
@@ -309,6 +415,8 @@ export function createModelChannel(channel?: Partial<ModelChannel>): ModelChanne
         apiKey: channel?.apiKey || "",
         apiFormat,
         models: normalizeChannelModels(channel?.models),
+        editJson: channel?.editJson === true,
+        locked: channel?.locked === true,
     };
 }
 
@@ -394,11 +502,23 @@ export function modelOptionName(value: string) {
     return decodeChannelModel(value)?.model || value;
 }
 
+export function modelDisplayName(config: AiConfig, value: string): string {
+    const decoded = decodeChannelModel(value);
+    const modelId = decoded?.model || value;
+    if (decoded) {
+        const channel = config.channels.find((item) => item.id === decoded.channelId);
+        const model = channel?.models.find((item) => item.name === modelId);
+        if (model?.displayName?.trim()) return model.displayName.trim();
+    }
+    return modelId;
+}
+
 export function modelOptionLabel(config: AiConfig, value: string) {
     const decoded = decodeChannelModel(value);
     if (!decoded) return value;
     const channel = config.channels.find((item) => item.id === decoded.channelId);
-    return channel ? `${decoded.model}（${channel.name}）` : decoded.model;
+    const label = modelDisplayName(config, value);
+    return channel ? `${label}（${channel.name}）` : label;
 }
 
 export function modelOptionsFromChannels(channels: ModelChannel[]) {
@@ -435,7 +555,7 @@ export function resolveModelRequestConfig(config: AiConfig, value: string) {
     };
 }
 
-function normalizeChannels(config: AiConfig) {
+function normalizeChannels(config: AiConfig, createFallback: boolean) {
     const persistedChannels = Array.isArray(config.channels) ? config.channels : [];
     const channels = persistedChannels.map((channel, index) =>
         createModelChannel({
@@ -445,7 +565,8 @@ function normalizeChannels(config: AiConfig) {
             models: normalizeChannelModels(channel.models),
         }),
     );
-    if (!channels.length) {
+    // Legacy saves stored one connection at the top level, so build a channel for them.
+    if (!channels.length && createFallback) {
         channels.push(
             createModelChannel({
                 id: "default",
@@ -462,11 +583,15 @@ function normalizeChannels(config: AiConfig) {
 
 export function defaultBaseUrlForApiFormat(apiFormat: ApiCallFormat) {
     if (apiFormat === "gemini") return GEMINI_BASE_URL;
+    if (apiFormat === "seedream") return SEEDREAM_BASE_URL;
+    if (apiFormat === "autodl") return AUTODL_BASE_URL;
+    if (apiFormat === "grok") return GROK_BASE_URL;
     return OPENAI_BASE_URL;
 }
 
 function normalizeApiFormat(apiFormat: unknown): ApiCallFormat {
-    return apiFormat === "gemini" ? apiFormat : "openai";
+    if (apiFormat === "gemini" || apiFormat === "seedream" || apiFormat === "autodl" || apiFormat === "grok") return apiFormat;
+    return "openai";
 }
 
 function uniqueModelOptions(models: string[]) {

@@ -1,0 +1,224 @@
+{
+  "app": "infinite-canvas",
+  "version": 1,
+  "exportedAt": "2026-09-11T03:24:16.263Z",
+  "config": {
+    "channelMode": "local",
+    "baseUrl": "https://hub.oaifree.com",
+    "apiKey": "ah-f6742eb7da2447b316fda4d65aaf0c8b496ebeb8095d0198a1fd280e64ce6bc7",
+    "apiFormat": "openai",
+    "channels": [
+      {
+        "id": "a31WY3cB8ftxcCGKQ_TVo",
+        "name": "LinuxDoHub",
+        "baseUrl": "https://hub.oaifree.com",
+        "apiKey": "ah-f6742eb7da2447b316fda4d65aaf0c8b496ebeb8095d0198a1fd280e64ce6bc7",
+        "apiFormat": "openai",
+        "models": [
+          {
+            "name": "gpt-5.6",
+            "capability": "text"
+          },
+          {
+            "name": "gpt-image-2",
+            "capability": "image"
+          },
+          {
+            "name": "gpt-image-2.5",
+            "capability": "image"
+          },
+          {
+            "name": "gpt-image-2.5-flare",
+            "capability": "image"
+          },
+          {
+            "name": "gpt-image-2.5-sunburst",
+            "capability": "image"
+          }
+        ],
+        "editJson": false,
+        "locked": true
+      },
+      {
+        "id": "PmVPhmGkmC8ec2FEvsnqS",
+        "name": "中转luckyg",
+        "baseUrl": "https://luckyg.131518.xyz/",
+        "apiKey": "sk-tHeoexSibm6n0QgSquiZ3YIfUtGJDX2givfHTQsMSAmEqNI5",
+        "apiFormat": "openai",
+        "models": [
+          {
+            "name": "grok-4.5",
+            "capability": "text"
+          },
+          {
+            "name": "grok-4.6",
+            "capability": "text"
+          },
+          {
+            "name": "grok-build-0.1",
+            "capability": "text"
+          },
+          {
+            "name": "grok-imagine-image-2.0",
+            "capability": "image"
+          },
+          {
+            "name": "grok-imagine-image",
+            "capability": "image"
+          },
+          {
+            "name": "grok-imagine-image-lite",
+            "capability": "image"
+          },
+          {
+            "name": "grok-imagine-video",
+            "capability": "video"
+          }
+        ],
+        "editJson": true,
+        "locked": true
+      },
+      {
+        "id": "-2N5pdiFS3yJ3ZxhE3WnS",
+        "name": "火山",
+        "baseUrl": "https://chat.2760316.cn/ark",
+        "apiKey": "b6df77ab-006a-43ed-8871-4becc44e7449",
+        "apiFormat": "seedream",
+        "models": [
+          {
+            "name": "ep-20260907162158-54669",
+            "capability": "image",
+            "displayName": "doubao-seedream-5.0-pro(每天限量100张)"
+          }
+        ],
+        "editJson": false,
+        "locked": true
+      },
+      {
+        "id": "_U19fS1Ibm7D91sGzAvUX",
+        "name": "AutoDL",
+        "baseUrl": "https://autodl.art/api/v1/comfyui",
+        "apiKey": "BwjXG6f8lpXyUH1VFIGSrO04Pd6Y9ntkjHbga3LE29DVl9Xm",
+        "apiFormat": "autodl",
+        "models": [
+          {
+            "name": "minimax_h3_lightx2v_v5",
+            "capability": "video"
+          }
+        ],
+        "editJson": false,
+        "locked": true
+      }
+    ],
+    "model": "default::gpt-image-2",
+    "imageModel": "a31WY3cB8ftxcCGKQ_TVo::gpt-image-2",
+    "videoModel": "_U19fS1Ibm7D91sGzAvUX::minimax_h3_lightx2v_v5",
+    "textModel": "a31WY3cB8ftxcCGKQ_TVo::gpt-5.6",
+    "audioModel": "",
+    "audioVoice": "alloy",
+    "audioFormat": "mp3",
+    "audioSpeed": "1",
+    "audioInstructions": "",
+    "videoSeconds": "6",
+    "vquality": "720",
+    "videoGenerateAudio": "true",
+    "videoWatermark": "false",
+    "videoMode": "frames",
+    "systemPrompt": "",
+    "reasoningEffort": "auto",
+    "models": [
+      "a31WY3cB8ftxcCGKQ_TVo::gpt-5.6",
+      "a31WY3cB8ftxcCGKQ_TVo::gpt-image-2",
+      "a31WY3cB8ftxcCGKQ_TVo::gpt-image-2.5",
+      "a31WY3cB8ftxcCGKQ_TVo::gpt-image-2.5-flare",
+      "a31WY3cB8ftxcCGKQ_TVo::gpt-image-2.5-sunburst",
+      "PmVPhmGkmC8ec2FEvsnqS::grok-4.5",
+      "PmVPhmGkmC8ec2FEvsnqS::grok-4.6",
+      "PmVPhmGkmC8ec2FEvsnqS::grok-build-0.1",
+      "PmVPhmGkmC8ec2FEvsnqS::grok-imagine-image-2.0",
+      "PmVPhmGkmC8ec2FEvsnqS::grok-imagine-image",
+      "PmVPhmGkmC8ec2FEvsnqS::grok-imagine-image-lite",
+      "PmVPhmGkmC8ec2FEvsnqS::grok-imagine-video",
+      "-2N5pdiFS3yJ3ZxhE3WnS::ep-20260907162158-54669",
+      "_U19fS1Ibm7D91sGzAvUX::minimax_h3_lightx2v_v5"
+    ],
+    "quality": "auto",
+    "size": "1024x1024",
+    "background": "",
+    "count": "1",
+    "canvasImageCount": "1",
+    "proxyEnabled": false,
+    "proxyUrl": "http://127.0.0.1:23210"
+  },
+  "webdav": {
+    "url": "",
+    "username": "",
+    "password": "",
+    "directory": "infinite-canvas",
+    "lastSyncedAt": ""
+  },
+  "promptSources": {
+    "sources": [
+      {
+        "id": "banana-prompt-quicker",
+        "name": "Banana Prompt Quicker",
+        "url": "https://raw.githubusercontent.com/yukkcat/image-prompts/main/dist/sources/banana-prompt-quicker.json",
+        "homepage": "https://glidea.github.io/banana-prompt-quicker/",
+        "enabled": true,
+        "builtIn": true
+      },
+      {
+        "id": "davidwu-gpt-image2-prompts",
+        "name": "DavidWu GPT Image 2",
+        "url": "https://raw.githubusercontent.com/yukkcat/image-prompts/main/dist/sources/davidwu-gpt-image2-prompts.json",
+        "homepage": "https://github.com/davidwuw0811-boop/awesome-gpt-image2-prompts",
+        "enabled": true,
+        "builtIn": true
+      },
+      {
+        "id": "freestylefly-gpt-image-2",
+        "name": "Freestylefly GPT Image 2",
+        "url": "https://raw.githubusercontent.com/yukkcat/image-prompts/main/dist/sources/freestylefly-gpt-image-2.json",
+        "homepage": "https://github.com/freestylefly/awesome-gpt-image-2",
+        "enabled": true,
+        "builtIn": true
+      },
+      {
+        "id": "awesome-gpt-image",
+        "name": "Awesome GPT Image",
+        "url": "https://raw.githubusercontent.com/yukkcat/image-prompts/main/dist/sources/awesome-gpt-image.json",
+        "homepage": "https://github.com/ZeroLu/awesome-gpt-image",
+        "enabled": true,
+        "builtIn": true
+      },
+      {
+        "id": "awesome-gpt4o-image-prompts",
+        "name": "Awesome GPT-4o",
+        "url": "https://raw.githubusercontent.com/yukkcat/image-prompts/main/dist/sources/awesome-gpt4o-image-prompts.json",
+        "homepage": "https://github.com/ImgEdify/Awesome-GPT4o-Image-Prompts",
+        "enabled": true,
+        "builtIn": true
+      },
+      {
+        "id": "youmind-gpt-image-2",
+        "name": "YouMind GPT Image 2",
+        "url": "https://raw.githubusercontent.com/yukkcat/image-prompts/main/dist/sources/youmind-gpt-image-2.json",
+        "homepage": "https://github.com/YouMind-OpenLab/awesome-gpt-image-2",
+        "enabled": true,
+        "builtIn": true
+      },
+      {
+        "id": "youmind-nano-banana-pro",
+        "name": "YouMind Nano Banana Pro",
+        "url": "https://raw.githubusercontent.com/yukkcat/image-prompts/main/dist/sources/youmind-nano-banana-pro.json",
+        "homepage": "https://github.com/YouMind-OpenLab/awesome-nano-banana-pro-prompts",
+        "enabled": true,
+        "builtIn": true
+      }
+    ],
+    "schedule": {
+      "intervalMinutes": 30,
+      "lastFetchedAt": ""
+    }
+  }
+}

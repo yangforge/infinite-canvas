@@ -1,6 +1,6 @@
 import { App, Button, Form, Input, Modal, Progress, Select, Tabs } from "antd";
 import type { TFunction } from "i18next";
-import { Cloud, Download, Pencil, Plus, RefreshCw, Trash2, Upload, Wifi } from "lucide-react";
+import { Cloud, Download, Link, Lock, Pencil, Plus, RefreshCw, Trash2, Upload, Wifi } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -10,11 +10,11 @@ import { ConfigLocalProxy } from "@/components/layout/config-local-proxy";
 import { ConfigPromptSources } from "@/components/layout/config-prompt-sources";
 import { ConfigLocalStorage } from "@/components/layout/config-local-storage";
 import type { AppLocale } from "@/i18n";
-import { exportAppConfig, importAppConfig } from "@/services/config-file";
+import { exportAppConfig, importAppConfig, importAppConfigFromUrl } from "@/services/config-file";
 import { syncAppDataToWebdav, type AppSyncDomainKey, type AppSyncProgressEvent } from "@/services/app-sync";
 import { testWebdavConnection, WEBDAV_MANIFEST_FILE_NAME } from "@/services/webdav-sync";
 import { audioFormatOptions, audioVoiceOptions, normalizeAudioSpeedValue } from "@/lib/audio-generation";
-import { createModelChannel, modelOptionsFromChannels, normalizeModelOptionValue, selectableModelsByCapability, useConfigStore, type AiConfig, type ApiCallFormat, type ConfigTabKey, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
+import { createModelChannel, modelOptionsFromChannels, pickDefaultModel, useConfigStore, type AiConfig, type ApiCallFormat, type ConfigTabKey, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
 
 type ModelGroup = {
     capability: ModelCapability;
@@ -51,6 +51,9 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
     const { message } = App.useApp();
     const { i18n, t } = useTranslation();
     const configInputRef = useRef<HTMLInputElement>(null);
+    const [urlImportOpen, setUrlImportOpen] = useState(false);
+    const [urlImportValue, setUrlImportValue] = useState("");
+    const [importingUrl, setImportingUrl] = useState(false);
     const [activeTab, setActiveTab] = useState<ConfigTabKey>(initialTab);
     const [editingChannelId, setEditingChannelId] = useState("");
     const [testingWebdav, setTestingWebdav] = useState(false);
@@ -92,24 +95,44 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
         }
     };
 
+    const importFromUrl = async () => {
+        const url = urlImportValue.trim();
+        if (!url) {
+            message.error(t("config.importUrlEmpty"));
+            return;
+        }
+        setImportingUrl(true);
+        try {
+            await importAppConfigFromUrl(url);
+            message.success(t("config.imported"));
+            setUrlImportOpen(false);
+            setUrlImportValue("");
+        } catch (error) {
+            message.error(error instanceof Error ? error.message : t("config.importFailed"));
+        } finally {
+            setImportingUrl(false);
+        }
+    };
+
     const updateChannels = (channels: ModelChannel[]) => saveConfig(withChannels(config, channels));
 
     const addChannel = () => {
-        const channel = createModelChannel({ name: t("config.channels.numberedName", { count: config.channels.length + 1 }) });
+        const channel = createModelChannel({ name: t("config.channels.numberedName", { count: config.channels.filter((item) => !item.locked).length + 1 }) });
         updateChannels([...config.channels, channel]);
         setEditingChannelId(channel.id);
     };
 
     const deleteChannel = (id: string) => {
-        if (config.channels.length <= 1) {
+        const remaining = config.channels.filter((channel) => channel.id !== id);
+        if (!remaining.length) {
             message.warning(t("config.channels.keepOne"));
             return;
         }
-        updateChannels(config.channels.filter((channel) => channel.id !== id));
+        updateChannels(remaining);
     };
 
     const saveChannel = (channel: ModelChannel) => {
-        updateChannels(config.channels.map((item) => (item.id === channel.id ? channel : item)));
+        updateChannels(config.channels.map((item) => (item.id === channel.id ? { ...channel, locked: false } : item)));
     };
 
     const testWebdav = async () => {
@@ -170,12 +193,35 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                     <Button icon={<Upload className="size-4" />} onClick={() => configInputRef.current?.click()}>
                         {t("config.import")}
                     </Button>
+                    <Button icon={<Link className="size-4" />} onClick={() => setUrlImportOpen(true)}>
+                        {t("config.importUrl")}
+                    </Button>
                     <Button icon={<Download className="size-4" />} onClick={exportAppConfig}>
                         {t("config.export")}
                     </Button>
                     <input ref={configInputRef} type="file" accept="application/json,.json" className="hidden" onChange={(event) => event.target.files?.[0] && void loadConfigFile(event.target.files[0])} />
                 </div>
             </div>
+            <Modal
+                title={t("config.importUrlTitle")}
+                open={urlImportOpen}
+                onCancel={() => setUrlImportOpen(false)}
+                onOk={() => void importFromUrl()}
+                okText={t("config.import")}
+                cancelText={t("common.cancel")}
+                confirmLoading={importingUrl}
+                destroyOnClose
+            >
+                <Input
+                    value={urlImportValue}
+                    placeholder={t("config.importUrlPlaceholder")}
+                    onChange={(event) => setUrlImportValue(event.target.value)}
+                    onPressEnter={() => void importFromUrl()}
+                    spellCheck={false}
+                    autoFocus
+                />
+                <div className="mt-2 text-xs text-stone-500">{t("config.fileSecurity")}</div>
+            </Modal>
             <Tabs
                 activeKey={activeTab}
                 onChange={(key) => setActiveTab(key as ConfigTabKey)}
@@ -195,7 +241,15 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                                     {config.channels.map((channel) => (
                                         <div key={channel.id} className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 px-4 py-3 dark:border-stone-800">
                                             <div className="min-w-0">
-                                                <div className="truncate text-sm font-semibold">{channel.name || t("config.channels.unnamed")}</div>
+                                                <div className="flex min-w-0 items-center gap-2">
+                                                    <span className="truncate text-sm font-semibold">{channel.name || t("config.channels.unnamed")}</span>
+                                                    {channel.locked ? (
+                                                        <span className="inline-flex shrink-0 items-center gap-1 rounded border border-stone-200 px-1.5 py-px text-[11px] leading-4 text-stone-500 dark:border-stone-700">
+                                                            <Lock className="size-3" />
+                                                            {t("config.channels.lockedTag")}
+                                                        </span>
+                                                    ) : null}
+                                                </div>
                                                 <div className="mt-1 truncate text-xs text-stone-500">
                                                     {apiFormatLabel(channel.apiFormat)} · {t("config.channels.modelCount", { count: channel.models.length })} · {channel.baseUrl || t("config.channels.missingUrl")}
                                                 </div>
@@ -380,18 +434,14 @@ function withChannels(config: AiConfig, channels: ModelChannel[]): AiConfig {
     };
 }
 
-function pickDefaultModel(config: AiConfig, capability: ModelCapability, current: string) {
-    const options = selectableModelsByCapability(config, capability);
-    const normalized = normalizeModelOptionValue(current, config.channels);
-    return options.includes(normalized) ? normalized : options[0] || "";
-}
-
 function normalizeImageCount(value: string) {
     return String(Math.max(1, Math.min(15, Math.floor(Math.abs(Number(value)) || 3))));
 }
 
 function apiFormatLabel(apiFormat: ApiCallFormat) {
     if (apiFormat === "gemini") return "Gemini";
+    if (apiFormat === "seedream") return "火山方舟 Seedream";
+    if (apiFormat === "autodl") return "AutoDL ComfyUI";
     return "OpenAI";
 }
 

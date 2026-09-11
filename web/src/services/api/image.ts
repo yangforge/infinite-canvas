@@ -1,7 +1,7 @@
 import axios from "axios";
 
 import i18n from "@/i18n";
-import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
+import { buildApiUrl, resolveChannelEditJson, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
 import { normalizePluginImages, runModelPlugin } from "./model-plugin";
 import { nanoid } from "nanoid";
 import { dataUrlToFile } from "@/lib/image-utils";
@@ -119,6 +119,39 @@ const IMAGE_OUTPUT_FORMAT = "png";
 
 const GEMINI_SUPPORTED_RATIOS = ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"];
 const GEMINI_IMAGE_SIZE_BY_QUALITY: Record<string, string> = { low: "1K", medium: "2K", high: "4K", standard: "1K", hd: "2K" };
+
+const SEEDREAM_DEFAULT_SIZE = "2048x2048";
+
+// Grok Imagine only accepts these fixed aspect ratios and a 1k/2k resolution; it rejects/ignores size/quality/output_format.
+const GROK_ASPECT_RATIOS: Array<{ value: string; ratio: number }> = [
+    { value: "1:1", ratio: 1 },
+    { value: "16:9", ratio: 16 / 9 },
+    { value: "9:16", ratio: 9 / 16 },
+    { value: "4:3", ratio: 4 / 3 },
+    { value: "3:4", ratio: 3 / 4 },
+];
+function grokResolution(quality?: string): string {
+    // Grok only supports 1k/2k; map by the quality's pixel target (2k+ -> 2k, else 1k). 4k caps at 2k.
+    const pixels = quality ? QUALITY_BASE[quality] : undefined;
+    return pixels && pixels >= 2048 ? "2k" : "1k";
+}
+
+function isGrokModel(model: string) {
+    return /grok|imagine/i.test(model);
+}
+
+function ratioFromSize(size?: string): number | undefined {
+    const match = size?.match(/^(\d+)x(\d+)$/);
+    if (!match) return undefined;
+    return Number(match[1]) / Number(match[2]);
+}
+
+/** Map any requested size to the nearest Grok-supported aspect ratio (Grok only allows 5 fixed values). */
+function nearestGrokAspectRatio(size?: string): string {
+    const ratio = ratioFromSize(size);
+    if (!ratio) return "1:1";
+    return GROK_ASPECT_RATIOS.reduce<(typeof GROK_ASPECT_RATIOS)[number]>((best, candidate) => (Math.abs(candidate.ratio - ratio) < Math.abs(best.ratio - ratio) ? candidate : best), GROK_ASPECT_RATIOS[0]).value;
+}
 
 function normalizeQuality(quality: string) {
     const value = quality.trim().toLowerCase();
@@ -339,7 +372,9 @@ function withSystemPrompt(config: AiConfig, prompt: string) {
     return systemPrompt ? `${systemPrompt}\n\n${prompt}` : prompt;
 }
 
-function aiApiUrl(config: AiConfig, path: string) {
+/** 火山方舟 uses an /api/v3 style base, so no /v1 segment is appended for it. */
+function aiApiUrl(config: Pick<AiConfig, "baseUrl" | "apiFormat">, path: string) {
+    if (config.apiFormat === "seedream") return withLocalProxy(`${config.baseUrl.trim().replace(/\/+$/, "")}${path}`);
     return buildApiUrl(config.baseUrl, path);
 }
 
@@ -720,6 +755,53 @@ function parseGeminiImagePayload(payload: GeminiPayload) {
     return images;
 }
 
+/** Providers such as xAI only accept application/json for /images/edits; one reference uses `image`, several use `images`. */
+async function requestJsonEdit(config: AiConfig, prompt: string, references: ReferenceImage[], n: number, options?: RequestOptions) {
+    const images = await Promise.all(references.map((image) => imageToDataUrl(image)));
+    const response = await axios.post<ImageApiResponse>(
+        aiApiUrl(config, "/images/edits"),
+        {
+            model: config.model,
+            prompt,
+            n,
+            response_format: "b64_json",
+            ...(images.length === 1 ? { image: { url: images[0], type: "image_url" } } : { images: images.map((url) => ({ url, type: "image_url" })) }),
+        },
+        { headers: aiHeaders(config, "application/json"), signal: options?.signal },
+    );
+    return parseImagePayload(response.data);
+}
+
+function resolveSeedreamSize(config: AiConfig) {
+    const value = config.size.trim();
+    if (!value || value.toLowerCase() === "auto") return SEEDREAM_DEFAULT_SIZE;
+    if (parseImageDimensions(value)) return value;
+    // Seedream defaults to 2K, so an unset quality also resolves to the 2k preset.
+    return resolveSize(normalizeQuality(config.quality) || "medium", value);
+}
+
+/** Seedream generates and edits through the same endpoint; it ignores `n`, so each image needs its own request. */
+async function requestSeedreamImages(config: AiConfig, prompt: string, references: ReferenceImage[], n: number, options?: RequestOptions) {
+    const images = references.length ? await Promise.all(references.map((image) => imageToDataUrl(image))) : [];
+    return (await Promise.all(Array.from({ length: n }, () => requestSeedreamImagesOnce(config, prompt, images, options)))).flat();
+}
+
+async function requestSeedreamImagesOnce(config: AiConfig, prompt: string, images: string[], options?: RequestOptions) {
+    const response = await axios.post<ImageApiResponse>(
+        aiApiUrl(config, "/images/generations"),
+        {
+            model: config.model,
+            prompt: withSystemPrompt(config, prompt),
+            response_format: "b64_json",
+            size: resolveSeedreamSize(config),
+            watermark: false,
+            ...(images.length ? { image: images } : {}),
+        },
+        { headers: aiHeaders(config, "application/json"), signal: options?.signal },
+    );
+    return parseImagePayload(response.data);
+}
+
 export async function requestGeneration(config: AiConfig, prompt: string, options?: RequestOptions) {
     const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
@@ -750,23 +832,39 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
             throw new Error(readAxiosError(error, apiText("requestFailed")));
         }
     }
+    if (requestConfig.apiFormat === "seedream") {
+        try {
+            return await requestSeedreamImages(requestConfig, prompt, [], n, options);
+        } catch (error) {
+            throw new Error(readAxiosError(error, apiText("requestFailed")));
+        }
+    }
     const quality = normalizeQuality(config.quality);
     const requestSize = resolveRequestSize(quality, config.size);
     const background = normalizeBackground(config.background);
+    const isGrok = isGrokModel(requestConfig.model);
+    const body: Record<string, unknown> = {
+        model: requestConfig.model,
+        prompt: withSystemPrompt(requestConfig, prompt),
+        n,
+    };
+    if (isGrok) {
+        // Grok Imagine uses aspect_ratio (5 fixed values) + resolution (1k/2k); it rejects/ignores size/quality/output_format.
+        body.aspect_ratio = nearestGrokAspectRatio(requestSize);
+        body.resolution = grokResolution(quality);
+        body.response_format = "b64_json";
+    } else {
+        if (quality) body.quality = quality;
+        if (requestSize) body.size = requestSize;
+        if (background) body.background = background;
+        // gpt-image models reject response_format; they always return b64.
+        if (!/gpt-image/.test(requestConfig.model)) body.response_format = "b64_json";
+        body.output_format = IMAGE_OUTPUT_FORMAT;
+    }
     try {
         const response = await axios.post<ImageApiResponse>(
             aiApiUrl(requestConfig, "/images/generations"),
-            {
-                model: requestConfig.model,
-                prompt: withSystemPrompt(requestConfig, prompt),
-                n,
-                ...(quality ? { quality } : {}),
-                ...(requestSize ? { size: requestSize } : {}),
-                ...(background ? { background } : {}),
-                // gpt-image models reject response_format; they always return b64.
-                ...(/gpt-image/.test(requestConfig.model) ? {} : { response_format: "b64_json" }),
-                output_format: IMAGE_OUTPUT_FORMAT,
-            },
+            body,
             {
                 headers: aiHeaders(requestConfig, "application/json"),
                 signal: options?.signal,
@@ -811,10 +909,25 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
             throw new Error(readAxiosError(error, apiText("requestFailed")));
         }
     }
+    if (requestConfig.apiFormat === "seedream") {
+        try {
+            return await requestSeedreamImages(requestConfig, requestPrompt, references, n, options);
+        } catch (error) {
+            throw new Error(readAxiosError(error, apiText("requestFailed")));
+        }
+    }
+    if (resolveChannelEditJson(config, config.model || config.imageModel)) {
+        try {
+            return await requestJsonEdit(requestConfig, withSystemPrompt(requestConfig, requestPrompt), references, n, options);
+        } catch (error) {
+            throw new Error(readAxiosError(error, apiText("requestFailed")));
+        }
+    }
 
     const quality = normalizeQuality(config.quality);
     const requestSize = resolveRequestSize(quality, config.size);
     const background = normalizeBackground(config.background);
+    const isGrok = isGrokModel(requestConfig.model);
     const formData = new FormData();
     formData.set("model", requestConfig.model);
     formData.set("prompt", withSystemPrompt(requestConfig, requestPrompt));
@@ -823,15 +936,21 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
     if (!/gpt-image/.test(requestConfig.model)) {
         formData.set("response_format", "b64_json");
     }
-    formData.set("output_format", IMAGE_OUTPUT_FORMAT);
-    if (quality) {
-        formData.set("quality", quality);
-    }
-    if (requestSize) {
-        formData.set("size", requestSize);
-    }
-    if (background) {
-        formData.set("background", background);
+    if (isGrok) {
+        // Grok edits use the same aspect_ratio + resolution convention as generations.
+        formData.set("aspect_ratio", nearestGrokAspectRatio(requestSize));
+        formData.set("resolution", grokResolution(quality));
+    } else {
+        formData.set("output_format", IMAGE_OUTPUT_FORMAT);
+        if (quality) {
+            formData.set("quality", quality);
+        }
+        if (requestSize) {
+            formData.set("size", requestSize);
+        }
+        if (background) {
+            formData.set("background", background);
+        }
     }
     const files = await Promise.all(references.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
     const imageField = files.length > 1 ? "image[]" : "image";
@@ -894,7 +1013,7 @@ export async function fetchImageModels(config: Pick<AiConfig, "baseUrl" | "apiKe
                 .filter((id): id is string => Boolean(id))
                 .sort((a, b) => a.localeCompare(b));
         }
-        const response = await axios.get<{ data?: Array<{ id?: string }>; error?: { message?: string } }>(buildApiUrl(config.baseUrl, "/models"), {
+        const response = await axios.get<{ data?: Array<{ id?: string }>; error?: { message?: string } }>(aiApiUrl(config, "/models"), {
             headers: {
                 Authorization: `Bearer ${config.apiKey}`,
             },

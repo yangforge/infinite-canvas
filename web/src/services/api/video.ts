@@ -6,7 +6,7 @@ import { dataUrlToFile, readFileAsDataUrl } from "@/lib/image-utils";
 import { clampVideoSeconds, computeVideoSize, inferVideoRatio } from "@/lib/media-size";
 import { getMediaBlob, resolveMediaUrl, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { imageToDataUrl } from "@/services/image-storage";
-import { boolConfig, buildApiUrl, modelOptionName, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
+import { AUTODL_DEFAULT_PARAMS, boolConfig, buildApiUrl, modelOptionName, resolveModelParams, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
 import { runModelPlugin } from "./model-plugin";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
@@ -19,7 +19,7 @@ type VideoMediaOptions = RequestOptions & { videos?: ReferenceVideo[]; audios?: 
 const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiErrors.${key}`, options);
 
 export type VideoGenerationResult = { blob?: Blob; url?: string; mimeType?: string };
-export type VideoGenerationTask = { id: string; provider: "openai" | "gemini" | "plugin"; model: string };
+export type VideoGenerationTask = { id: string; provider: "openai" | "gemini" | "autodl" | "plugin"; model: string };
 type GeminiInlineData = { bytesBase64Encoded: string; mimeType: string };
 type GeminiVideoOperation = {
     name?: string;
@@ -32,7 +32,16 @@ export type VideoGenerationTaskState = { status: "pending" } | { status: "comple
 /** Results for scripted (plugin) video models, which run their own create+poll in one shot at task creation. */
 const pluginVideoResults = new Map<string, VideoGenerationResult>();
 
-function aiApiUrl(config: AiConfig, path: string) {
+type AutodlTaskPayload = {
+    code?: string;
+    msg?: string;
+    error?: { message?: string };
+    data?: { task_id?: string; status?: string; results?: Array<string | { url?: string }> };
+};
+
+/** 火山方舟 and AutoDL use versioned base paths, so no /v1 segment is appended for them. */
+function aiApiUrl(config: Pick<AiConfig, "baseUrl" | "apiFormat">, path: string) {
+    if (config.apiFormat === "seedream" || config.apiFormat === "autodl") return withLocalProxy(`${config.baseUrl.trim().replace(/\/+$/, "")}${path}`);
     return buildApiUrl(config.baseUrl, path);
 }
 
@@ -76,6 +85,9 @@ export async function createVideoGenerationTask(config: AiConfig, prompt: string
     if (script) return createPluginVideoTask(requestConfig, selectedModel, script, prompt, references, options);
     assertVideoConfig(requestConfig, requestConfig.model);
     if (requestConfig.apiFormat === "gemini") return createGeminiVideoTask(requestConfig, selectedModel, prompt, references, options);
+    if (requestConfig.apiFormat === "autodl") return createAutodlVideoTask(requestConfig, selectedModel, prompt, references, options);
+    // grok-imagine-video takes a JSON body (image/images as data URIs); the multipart path below is for Sora and grok-video-1.5/3.
+    if (requestConfig.apiFormat === "grok" || isGrokVideoModel(selectedModel)) return createGrokVideoTask(requestConfig, selectedModel, prompt, references, options);
     return createOpenAIVideoTask(requestConfig, selectedModel, prompt, references, options);
 }
 
@@ -84,9 +96,12 @@ export async function pollVideoGenerationTask(config: AiConfig, task: VideoGener
         const result = pluginVideoResults.get(task.id);
         return result ? { status: "completed", result } : { status: "failed", error: apiText("pluginVideoExpired") };
     }
+    // Route by the resolved channel's apiFormat, identical to createVideoGenerationTask,
+    // so polling uses the same provider the task was actually created with.
     const requestConfig = resolveModelRequestConfig(config, task.model);
     assertVideoConfig(requestConfig, requestConfig.model);
-    if (task.provider === "gemini") return pollGeminiVideoTask(requestConfig, task, options);
+    if (requestConfig.apiFormat === "gemini") return pollGeminiVideoTask(requestConfig, task, options);
+    if (requestConfig.apiFormat === "autodl") return pollAutodlVideoTask(requestConfig, task, options);
     return pollOpenAIVideoTask(requestConfig, task, options);
 }
 
@@ -144,6 +159,45 @@ export async function storeGeneratedVideo(result: VideoGenerationResult): Promis
         }
     }
     throw new Error(apiText("noPlayableVideo"));
+}
+
+function isGrokVideoModel(model: string) {
+    return /grok/i.test(modelOptionName(model));
+}
+
+/** grok-imagine-video only accepts these aspect ratios, so anything else (e.g. 21:9) snaps to the closest one. */
+const GROK_VIDEO_ASPECT_RATIOS = ["1:1", "2:3", "3:2", "4:3", "3:4", "16:9", "9:16", "2:1", "1:2", "19.5:9", "9:19.5", "20:9", "9:20"];
+function grokVideoAspectRatio(size: string) {
+    const ratio = inferVideoRatio(size);
+    if (ratio === "auto") return "16:9";
+    if (GROK_VIDEO_ASPECT_RATIOS.includes(ratio)) return ratio;
+    const target = Number(ratio.split(":")[0]) / Number(ratio.split(":")[1]);
+    return GROK_VIDEO_ASPECT_RATIOS.reduce((best, item) => {
+        const itemRatio = Number(item.split(":")[0]) / Number(item.split(":")[1]);
+        const bestRatio = Number(best.split(":")[0]) / Number(best.split(":")[1]);
+        return Math.abs(itemRatio - target) < Math.abs(bestRatio - target) ? item : best;
+    }, "16:9");
+}
+
+/** grok-imagine-video accepts JSON: model, prompt, seconds, aspect_ratio, resolution and image/images as data URIs. */
+async function createGrokVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
+    const images = (await Promise.all(references.map((image) => imageToDataUrl(image)))).filter(Boolean);
+    const body: Record<string, unknown> = {
+        model: modelOptionName(model),
+        prompt,
+        seconds: Number(normalizeVideoSeconds(config.videoSeconds)) || 4,
+        aspect_ratio: grokVideoAspectRatio(config.size),
+        resolution: normalizeVideoResolution(config.vquality).replace(/p$/i, "P"),
+    };
+    if (images.length === 1) body.image = images[0];
+    else if (images.length > 1) body.images = images;
+    try {
+        const created = unwrapVideoResponse((await axios.post<ApiVideoResponse>(aiApiUrl(config, "/videos"), body, { headers: aiHeaders(config, "application/json"), signal: options?.signal })).data);
+        if (!created.id) throw new Error(apiText("noVideoTaskId"));
+        return { id: created.id, provider: "openai", model };
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("videoTaskCreateFailed")));
+    }
 }
 
 async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
@@ -249,6 +303,163 @@ async function pollGeminiVideoTask(config: AiConfig, task: VideoGenerationTask, 
     } catch (error) {
         throw new Error(readAxiosError(error, apiText("videoTaskQueryFailed")));
     }
+}
+
+/** Workflows encode orientation in the resolution value: "480p横", "480p竖" or "480p(1:1)" for square and auto ratios. */
+function videoOrientation(size: string) {
+    const ratio = inferVideoRatio(size);
+    const [width, height] = ratio.split(":").map(Number);
+    if (!width || !height || width === height) return "(1:1)";
+    return width > height ? "横" : "竖";
+}
+
+/** Empty placeholders become a marker so the key can be dropped after parsing, letting one template serve both image and non-image workflows. */
+const EMPTY_PLACEHOLDER = "__autodl_empty_";
+
+/** A quoted placeholder keeps its JSON type, so `"{{duration}}"` and `{{duration}}` both yield a number. */
+const WORKFLOW_PLACEHOLDERS = ["prompt", "duration", "resolution", "orientation", "size", "image", "image0", "image1", "image2"];
+
+function renderWorkflowParams(template: string, values: Record<string, string>) {
+    const source = template.trim() || AUTODL_DEFAULT_PARAMS;
+    const rendered = source.replace(/\{\{\s*(\w+)\s*\}\}/g, (match, key: string, offset: number) => {
+        const value = values[key];
+        if (value === undefined) {
+            throw new Error(apiText("unknownWorkflowPlaceholder", { placeholder: match, placeholders: WORKFLOW_PLACEHOLDERS.join("、") }));
+        }
+        // A placeholder adjacent to a double-quote lives inside a JSON string literal and must keep its quotes; otherwise it is a
+        // standalone value where strings must be quoted to stay valid JSON (e.g. an unquoted data URL like `"image": {{image}}`).
+        const prev = lastNonSpaceChar(source.slice(0, offset));
+        const next = firstNonSpaceChar(source.slice(offset + match.length));
+        const inString = prev === '"' || next === '"';
+        if (value === "") {
+            // A sole empty placeholder (the only thing between its quotes) emits the marker so the whole key is dropped; an empty
+            // placeholder concatenated inside a string (e.g. "{{resolution}}{{orientation}}") must contribute nothing.
+            if (prev === '"' && next === '"') return `${EMPTY_PLACEHOLDER}${key}`;
+            if (inString) return "";
+            return JSON.stringify(`${EMPTY_PLACEHOLDER}${key}`);
+        }
+        const isNumber = /^-?\d+(\.\d+)?$/.test(value);
+        if (inString) return isNumber ? value : JSON.stringify(value).slice(1, -1);
+        return isNumber ? value : JSON.stringify(value);
+    });
+    try {
+        return omitEmptyPlaceholders(JSON.parse(rendered) as Record<string, unknown>) as Record<string, unknown>;
+    } catch {
+        throw new Error(apiText("invalidWorkflowParams"));
+    }
+}
+
+function lastNonSpaceChar(text: string): string {
+    for (let index = text.length - 1; index >= 0; index--) {
+        if (!/\s/.test(text[index])) return text[index];
+    }
+    return "";
+}
+
+function firstNonSpaceChar(text: string): string {
+    for (let index = 0; index < text.length; index++) {
+        if (!/\s/.test(text[index])) return text[index];
+    }
+    return "";
+}
+
+function omitEmptyPlaceholders(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(omitEmptyPlaceholders);
+    if (value && typeof value === "object") {
+        const result: Record<string, unknown> = {};
+        for (const [key, item] of Object.entries(value)) {
+            const cleaned = omitEmptyPlaceholders(item);
+            if (typeof cleaned === "string" && cleaned.startsWith(EMPTY_PLACEHOLDER)) continue;
+            result[key] = cleaned;
+        }
+        return result;
+    }
+    return value;
+}
+
+async function createAutodlVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
+    const workflowId = modelOptionName(model).trim();
+    assertVideoConfig(config, workflowId);
+    const images = await Promise.all(references.map((image) => imageToDataUrl(image)));
+    const values: Record<string, string> = {
+        prompt,
+        duration: normalizeVideoSeconds(config.videoSeconds),
+        resolution: normalizeVideoResolution(config.vquality),
+        orientation: videoOrientation(config.size),
+        size: normalizeVideoSize(config.size, config.vquality) || "1280x720",
+        image: images[0] || "",
+    };
+    images.forEach((dataUrl, index) => {
+        values[`image${index}`] = dataUrl;
+    });
+    const body = renderWorkflowParams(resolveModelParams(config, model), values);
+    try {
+        return await submitAutodlWorkflow(config, workflowId, body, model, options);
+    } catch (error) {
+        // AutoDL reports required workflow inputs by name; when the missing one is a reference image we can satisfy it ourselves and retry.
+        const missing = missingReferenceImageParam(error);
+        if (missing && images.length) {
+            body[missing] = images[indexFromParamName(missing)] || images[0];
+            return await submitAutodlWorkflow(config, workflowId, body, model, options);
+        }
+        throw enhanceAutodlParamError(error);
+    }
+}
+
+async function submitAutodlWorkflow(config: AiConfig, workflowId: string, body: Record<string, unknown>, model: string, options?: VideoMediaOptions): Promise<VideoGenerationTask> {
+    const created = autodlTaskData((await axios.post<AutodlTaskPayload>(aiApiUrl(config, `/comfyui_workflow/${encodeURIComponent(workflowId)}`), body, { headers: aiHeaders(config, "application/json"), signal: options?.signal })).data, apiText("noVideoTask"));
+    if (!created.task_id) throw new Error(apiText("noVideoTaskId"));
+    return { id: created.task_id, provider: "autodl", model };
+}
+
+/** AutoDL's "缺少必填参数：X" names a required workflow input; return it when it looks like a reference image. */
+function missingReferenceImageParam(error: unknown): string | undefined {
+    const message = error instanceof Error ? readApiErrorMessage(error.message) || error.message : readApiErrorMessage(error);
+    const name = message.match(/缺少必填参数[：:]\s*([A-Za-z0-9_]+)/)?.[1];
+    return name && /(image|img|ref|reference|frame|photo|picture|cover)/i.test(name) ? name : undefined;
+}
+
+function indexFromParamName(name: string): number {
+    const match = name.match(/(\d+)\s*$/);
+    return match ? Number(match[1]) : 0;
+}
+
+function enhanceAutodlParamError(error: unknown): never {
+    const message = error instanceof Error ? error.message : String(error);
+    const name = message.match(/缺少必填参数[：:]\s*([A-Za-z0-9_]+)/)?.[1];
+    if (name) throw new Error(`${message}。请在模型「请求参数」中加入 "${name}": "{{image0}}"（参考图占位符为 {{image0}}、{{image1}}…），或先选择参考图再生成。`);
+    throw error;
+}
+
+async function pollAutodlVideoTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
+    try {
+        const payload = (await axios.get<AutodlTaskPayload>(aiApiUrl(config, `/comfyui_workflow/result/${encodeURIComponent(task.id)}`), { headers: aiHeaders(config), signal: options?.signal })).data;
+        const data = autodlTaskData(payload, apiText("videoTaskQueryFailed"));
+        const status = (data.status || "").toUpperCase();
+        if (status === "SUCCESS") {
+            const url = autodlResultUrl(data.results);
+            if (!url) return { status: "failed", error: apiText("noPlayableVideo") };
+            return { status: "completed", result: await videoResultFromUrl(url, options) };
+        }
+        if (status === "FAILED" || status === "CANCELLED") return { status: "failed", error: payload.msg || apiText("videoGenerationFailed") };
+        return { status: "pending" };
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("videoTaskQueryFailed")));
+    }
+}
+
+function autodlTaskData(payload: AutodlTaskPayload, emptyMessage: string) {
+    if (payload.code && payload.code !== "Success") throw new Error(payload.msg || readApiErrorMessage(payload.error?.message) || payload.code);
+    if (!payload.data) throw new Error(readApiErrorMessage(payload.error?.message) || payload.msg || emptyMessage);
+    return payload.data;
+}
+
+function autodlResultUrl(results: Array<string | { url?: string }> | undefined) {
+    for (const item of results || []) {
+        const url = typeof item === "string" ? item : item?.url;
+        if (url) return url;
+    }
+    return "";
 }
 
 function assertVideoConfig(config: AiConfig, model: string) {

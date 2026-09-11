@@ -10,10 +10,18 @@ export function ClientRootInit({ children }: { children: ReactNode }) {
     const { message } = App.useApp();
     const { t } = useTranslation();
     const handledConfigParams = useRef(false);
+    const loadedRemoteConfig = useRef(false);
     const importChannelCredentials = useConfigStore((state) => state.importChannelCredentials);
+    const loadRemoteConfig = useConfigStore((state) => state.loadRemoteConfig);
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
 
     usePromptSourceScheduler();
+
+    useEffect(() => {
+        if (loadedRemoteConfig.current) return;
+        loadedRemoteConfig.current = true;
+        void loadRemoteConfig();
+    }, [loadRemoteConfig]);
 
     useEffect(() => {
         if (handledConfigParams.current) return;
